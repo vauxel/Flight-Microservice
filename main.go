@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -11,9 +12,13 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/PuerkitoBio/goquery"
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/joho/godotenv"
+	"github.com/redis/go-redis/v9"
+	"github.com/tidwall/gjson"
 )
 
 type FlightsRes struct {
@@ -111,6 +116,7 @@ var AIRCRAFT_TYPES map[string][]string = map[string][]string{
 	"B38M": {"Boeing", "737 MX 8"},
 	"B39M": {"Boeing", "737 MX 9"},
 	"B3XM": {"Boeing", "737 MX 10"},
+	"B407": {"Bell", "407"},
 	"B461": {"BAe", "146-100"},
 	"B462": {"BAe", "146-200"},
 	"B463": {"BAe", "146-300"},
@@ -159,6 +165,7 @@ var AIRCRAFT_TYPES map[string][]string = map[string][]string{
 	"BLCF": {"Boeing", "747-400"},
 	"C130": {"Lockheed", "L-182"},
 	"C208": {"Cessna", "208"},
+	"C172": {"Cessna", "172"},
 	"C25A": {"Cessna", "CJ2"},
 	"C25B": {"Cessna", "CJ3"},
 	"C25C": {"Cessna", "CJ4"},
@@ -268,6 +275,7 @@ var AIRCRAFT_TYPES map[string][]string = map[string][]string{
 	"P8":   {"Boeing", "P-8"},
 	"P180": {"Piaggio", "P.180"},
 	"PAY2": {"Piper", "Chey 2"},
+	"PA18": {"Piper", "PA-18"},
 	"PC12": {"Pilatus", "PC-12"},
 	"PC24": {"Pilatus", "PC-24"},
 	"RJ1H": {"Avro", "RJ100"},
@@ -291,6 +299,8 @@ var AIRCRAFT_TYPES map[string][]string = map[string][]string{
 }
 
 var DATABASE_CONN *sql.DB
+
+var REDIS_CLIENT *redis.Client
 
 func ClampStringLength(s string, max_len int) string {
 	runes := []rune(s)
@@ -316,6 +326,11 @@ func GrabClosestFlight(flights []Flight, center_lat float64, center_long float64
 	var closest_flight *Flight
 
 	for i := range flights {
+		// Filter out unwanted flights (grounded / unknown aircraft)
+		if strings.TrimSpace(flights[i].Callsign) == "" || flights[i].AltitudeGeometric == 0 {
+			continue
+		}
+
 		flights[i].Distance = CalculateDistance(flights[i].Latitude, flights[i].Longitude, center_lat, center_long)
 		if closest_flight == nil || flights[i].Distance < closest_flight.Distance {
 			closest_flight = &flights[i]
@@ -335,15 +350,14 @@ func TranslateFlightAircraftType(aircraft_type string) (string, string) {
 	}
 }
 
-func FetchFlights(user_data *UserData) ([]Flight, error) {
+func FetchFlights(ctx context.Context, user_data *UserData) ([]Flight, error) {
 	auth_token := os.Getenv("ADSB_TOKEN")
 
 	radius := float64(user_data.Radius) * 0.868976 // Convert to nautical miles
 
 	var url string = fmt.Sprintf("https://adsbexchange-com1.p.rapidapi.com/v2/lat/%f/lon/%f/dist/%f/", user_data.Latitude, user_data.Longitude, radius)
 
-	req, err := http.NewRequest("GET", url, nil)
-
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return []Flight{}, fmt.Errorf("Unknown error making ADSB-E request: %v", err)
 	}
@@ -378,50 +392,84 @@ func FetchFlights(user_data *UserData) ([]Flight, error) {
 	return flights_res.Data, nil
 }
 
-func FetchFlightRoute(callsign string) string {
-	var url string = fmt.Sprintf("https://api.adsbdb.com/v0/callsign/%s", callsign)
+func FetchFlightRoute(ctx context.Context, callsign string) string {
+	if callsign == "" {
+		return ""
+	}
 
-	req, err := http.NewRequest("GET", url, nil)
+	// cached_flight_route, err := REDIS_CLIENT.Get(ctx, "route:"+callsign).Result()
+	// if err == nil {
+	// 	return cached_flight_route
+	// } else if err != redis.Nil {
+	// 	log.Println("WARNING: Redis GET operation returned an error", err)
+	// }
 
+	var url string = fmt.Sprintf("https://www.flightaware.com/live/flight/%s", callsign)
+
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
-		log.Println("ERROR: Unknown error making ADSB-DB request", err)
+		log.Println("ERROR: Unknown error making FlightAware request", err)
 		return ""
 	}
 
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {
-		log.Println("ERROR: Failed to make ADSB-DB request", err)
+		log.Println("ERROR: Failed to make FlightAware request", err)
 		return ""
 	}
 
 	defer res.Body.Close()
 
-	body, err := io.ReadAll(res.Body)
+	if res.StatusCode != 200 {
+		log.Println("ERROR: FlightRadar returned error status", res.Status)
+		return ""
+	}
+
+	doc, err := goquery.NewDocumentFromReader(res.Body)
 	if err != nil {
-		log.Println("ERROR: Failed to read ADSB-DB response", err)
+		log.Println("ERROR: Failed to read FlightRadar document", err)
 		return ""
 	}
 
-	if res.StatusCode != 200 && res.StatusCode != 404 {
-		log.Println("ERROR: ADSB-DB returned error status", res.Status, string(body))
+	json_payload := doc.Find("script").FilterFunction(func(i int, s *goquery.Selection) bool {
+		return strings.HasPrefix(s.Text(), "var trackpollBootstrap = ")
+	}).First().Text()
+
+	if json_payload == "" {
+		log.Println("ERROR: Failed to extract the FlightRadar JSON")
 		return ""
 	}
 
-	var route_res FlightRouteRes
+	json_payload = json_payload[len("var trackpollBootstrap = ") : len(json_payload)-1]
 
-	err = json.Unmarshal(body, &route_res)
+	if !gjson.Valid(json_payload) {
+		log.Println("ERROR: FlightRadar JSON is invalid")
+		return ""
+	}
+
+	origin := gjson.Get(json_payload, "flights."+callsign+"*.origin.iata")
+	destination := gjson.Get(json_payload, "flights."+callsign+"*.destination.iata")
+
+	if !origin.Exists() || !destination.Exists() {
+		log.Println("ERROR: Could not extract origin/destination from FlightRadar JSON")
+		return ""
+	}
+
+	flight_route := fmt.Sprintf("%s-%s", origin.Str, destination.Str)
+
+	_, err = REDIS_CLIENT.Set(ctx, "route:"+callsign, flight_route, 30*time.Minute).Result()
 	if err != nil {
-		log.Println("ERROR: Failed to parse ADSB-DB JSON", err)
-		return ""
+		log.Println("WARNING: Failed to set Redis key-value for flight route", err)
 	}
 
-	return fmt.Sprintf("%s-%s", route_res.Data.FlightRoute.Origin.IATACode, route_res.Data.FlightRoute.Destination.IATACode)
+	return flight_route
 }
 
-func FetchDataForUser(id int) *UserData {
+func FetchDataForUser(ctx context.Context, id int) *UserData {
 	var user UserData
 
-	err := DATABASE_CONN.QueryRow(
+	err := DATABASE_CONN.QueryRowContext(
+		ctx,
 		"SELECT latitude, longitude, radius FROM user_data WHERE id = ?",
 		id,
 	).Scan(
@@ -463,8 +511,24 @@ func SetupDB() error {
 		return fmt.Errorf("Failed to create SQLite DB table: %v", err)
 	}
 
-	log.Println("Table 'users' created successfully")
+	log.Println("SUCCESS: Established SQL connection")
 
+	return nil
+}
+
+func SetupRedis() error {
+	REDIS_CLIENT = redis.NewClient(&redis.Options{
+		Addr:     "localhost:6379",
+		Password: "", // no password
+		DB:       0,  // use default DB
+		Protocol: 2,
+	})
+
+	if err := REDIS_CLIENT.Ping(context.Background()).Err(); err != nil {
+		return fmt.Errorf("Failed to ping Redis: %v", err)
+	}
+
+	log.Println("SUCCESS: Established Redis connection")
 	return nil
 }
 
@@ -479,7 +543,7 @@ func HTTPFlights(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	user_data := FetchDataForUser(user_id)
+	user_data := FetchDataForUser(req.Context(), user_id)
 	if user_data == nil {
 		w.WriteHeader(http.StatusBadRequest)
 		fmt.Fprintf(w, "Error: Invalid user\n")
@@ -487,7 +551,7 @@ func HTTPFlights(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	flights, err := FetchFlights(user_data)
+	flights, err := FetchFlights(req.Context(), user_data)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		fmt.Fprintf(w, "Error: %s\n", err)
@@ -500,12 +564,30 @@ func HTTPFlights(w http.ResponseWriter, req *http.Request) {
 	}
 
 	closest_flight := GrabClosestFlight(flights, user_data.Latitude, user_data.Longitude)
+
+	if closest_flight == nil {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
 	closest_flight.Callsign = strings.ReplaceAll(closest_flight.Callsign, " ", "")
 	aircraft_make, aircraft_model := TranslateFlightAircraftType(closest_flight.AircraftType)
-	route := FetchFlightRoute(closest_flight.Callsign)
+	route := FetchFlightRoute(req.Context(), closest_flight.Callsign)
+
+	if route == "" {
+		route = "#"
+	}
+
+	if aircraft_make == "" {
+		aircraft_make = "#"
+	}
 
 	if aircraft_model == "" {
 		aircraft_model = closest_flight.AircraftType
+
+		if aircraft_model == "" {
+			aircraft_model = "#"
+		}
 	}
 
 	fmt.Fprintf(
@@ -522,15 +604,18 @@ func HTTPFlights(w http.ResponseWriter, req *http.Request) {
 
 func main() {
 	err := godotenv.Load()
-
 	if err != nil {
 		log.Fatalf("Error loading .env file: %s", err)
 	}
 
 	err = SetupDB()
-
 	if err != nil {
 		log.Fatalf("Error setting up DB connection: %s", err)
+	}
+
+	err = SetupRedis()
+	if err != nil {
+		log.Fatalf("Error setting up Redis connection: %s", err)
 	}
 
 	defer DATABASE_CONN.Close()
