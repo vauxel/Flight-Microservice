@@ -397,12 +397,12 @@ func FetchFlightRoute(ctx context.Context, callsign string) string {
 		return ""
 	}
 
-	// cached_flight_route, err := REDIS_CLIENT.Get(ctx, "route:"+callsign).Result()
-	// if err == nil {
-	// 	return cached_flight_route
-	// } else if err != redis.Nil {
-	// 	log.Println("WARNING: Redis GET operation returned an error", err)
-	// }
+	cached_flight_route, err := REDIS_CLIENT.Get(ctx, "route:"+callsign).Result()
+	if err == nil {
+		return cached_flight_route
+	} else if err != redis.Nil {
+		log.Println("WARNING: Redis GET operation returned an error", err)
+	}
 
 	var url string = fmt.Sprintf("https://www.flightaware.com/live/flight/%s", callsign)
 
