@@ -392,6 +392,13 @@ func FetchFlights(ctx context.Context, user_data *UserData) ([]Flight, error) {
 	return flights_res.Data, nil
 }
 
+func CacheFlightRoute(ctx context.Context, callsign string, route string) {
+	_, err := REDIS_CLIENT.Set(ctx, "route:"+callsign, route, 30*time.Minute).Result()
+	if err != nil {
+		log.Println("WARNING: Failed to set Redis key-value for flight route", err)
+	}
+}
+
 func FetchFlightRoute(ctx context.Context, callsign string) string {
 	if callsign == "" {
 		return ""
@@ -409,12 +416,14 @@ func FetchFlightRoute(ctx context.Context, callsign string) string {
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		log.Println("ERROR: Unknown error making FlightAware request", err)
+		CacheFlightRoute(ctx, callsign, "")
 		return ""
 	}
 
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {
 		log.Println("ERROR: Failed to make FlightAware request", err)
+		CacheFlightRoute(ctx, callsign, "")
 		return ""
 	}
 
@@ -422,12 +431,14 @@ func FetchFlightRoute(ctx context.Context, callsign string) string {
 
 	if res.StatusCode != 200 {
 		log.Println("ERROR: FlightRadar returned error status", res.Status)
+		CacheFlightRoute(ctx, callsign, "")
 		return ""
 	}
 
 	doc, err := goquery.NewDocumentFromReader(res.Body)
 	if err != nil {
 		log.Println("ERROR: Failed to read FlightRadar document", err)
+		CacheFlightRoute(ctx, callsign, "")
 		return ""
 	}
 
@@ -437,6 +448,7 @@ func FetchFlightRoute(ctx context.Context, callsign string) string {
 
 	if json_payload == "" {
 		log.Println("ERROR: Failed to extract the FlightRadar JSON")
+		CacheFlightRoute(ctx, callsign, "")
 		return ""
 	}
 
@@ -444,6 +456,7 @@ func FetchFlightRoute(ctx context.Context, callsign string) string {
 
 	if !gjson.Valid(json_payload) {
 		log.Println("ERROR: FlightRadar JSON is invalid")
+		CacheFlightRoute(ctx, callsign, "")
 		return ""
 	}
 
@@ -451,17 +464,12 @@ func FetchFlightRoute(ctx context.Context, callsign string) string {
 	destination := gjson.Get(json_payload, "flights."+callsign+"*.destination.iata")
 
 	if !origin.Exists() || !destination.Exists() {
-		log.Println("ERROR: Could not extract origin/destination from FlightRadar JSON")
+		CacheFlightRoute(ctx, callsign, "")
 		return ""
 	}
 
 	flight_route := fmt.Sprintf("%s-%s", origin.Str, destination.Str)
-
-	_, err = REDIS_CLIENT.Set(ctx, "route:"+callsign, flight_route, 30*time.Minute).Result()
-	if err != nil {
-		log.Println("WARNING: Failed to set Redis key-value for flight route", err)
-	}
-
+	CacheFlightRoute(ctx, callsign, flight_route)
 	return flight_route
 }
 
